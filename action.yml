@@ -1,0 +1,47 @@
+name: Compose Webhook
+description: POST an authenticated webhook that runs docker compose up --build -d on the host
+inputs:
+  url:
+    description: Webhook base or /hook URL (e.g. http://frps:19090/hook)
+    required: true
+  token:
+    description: Bearer token matching the listener WEBHOOK_TOKEN
+    required: true
+  timeout:
+    description: Seconds to wait for the 202 accept
+    required: false
+    default: '30'
+  wait:
+    description: If 'true', poll /status until compose finishes
+    required: false
+    default: 'false'
+  wait-timeout:
+    description: Seconds to wait when wait=true
+    required: false
+    default: '1800'
+outputs:
+  job-id:
+    description: Accepted job id
+    value: ${{ steps.trigger.outputs.job-id }}
+  status:
+    description: accepted | ok | fail
+    value: ${{ steps.trigger.outputs.status }}
+  http-code:
+    description: HTTP status from POST /hook
+    value: ${{ steps.trigger.outputs.http-code }}
+runs:
+  using: composite
+  steps:
+    - name: Trigger compose webhook
+      id: trigger
+      shell: bash
+      env:
+        WEBHOOK_URL: ${{ inputs.url }}
+        WEBHOOK_TOKEN: ${{ inputs.token }}
+        WEBHOOK_TIMEOUT: ${{ inputs.timeout }}
+        WEBHOOK_WAIT: ${{ inputs.wait }}
+        WEBHOOK_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+      run: bash "${{ github.action_path }}/scripts/trigger.sh"
+branding:
+  icon: upload-cloud
+  color: blue

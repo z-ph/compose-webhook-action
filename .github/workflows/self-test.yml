@@ -1,0 +1,35 @@
+name: Self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  listener:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Listener self-test
+        run: python3 listener/server.py --self-test
+      - name: Dry-run accept
+        env:
+          WEBHOOK_TOKEN: test-token-16xxxx
+          WEBHOOK_HOST: 127.0.0.1
+          WEBHOOK_PORT: 19090
+          WEBHOOK_DRY_RUN: "1"
+          COMPOSE_WORKDIR: ${{ github.workspace }}
+          COMPOSE_FILE: docker-compose.yml
+        run: |
+          python3 listener/server.py &
+          pid=$!
+          trap 'kill $pid' EXIT
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:19090/health && break
+            sleep 0.2
+          done
+          WEBHOOK_URL=http://127.0.0.1:19090/hook \
+          WEBHOOK_TOKEN=test-token-16xxxx \
+          WEBHOOK_WAIT=true \
+          WEBHOOK_WAIT_TIMEOUT=10 \
+            bash scripts/trigger.sh
