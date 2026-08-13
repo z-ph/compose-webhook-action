@@ -28,6 +28,10 @@ _lock = threading.Lock()
 _job: dict[str, Any] | None = None
 
 
+def stamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def load_env(path: Path) -> None:
     if not path.is_file():
         return
@@ -220,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
         xff = "-"
         if hasattr(self, "headers") and self.headers is not None:
             xff = self.headers.get("X-Forwarded-For", "-")
-        sys.stderr.write("%s xff=%s - %s\n" % (self.address_string(), xff, fmt % args))
+        sys.stderr.write("%s %s xff=%s - %s\n" % (stamp(), self.address_string(), xff, fmt % args))
 
     def _send(self, code: int, payload: dict[str, Any]) -> None:
         body = json_bytes(payload)
@@ -313,13 +317,13 @@ def main() -> int:
     port = int(os.environ.get("WEBHOOK_PORT", "19090"))
     dry = os.environ.get("WEBHOOK_DRY_RUN", "").strip() in {"1", "true", "yes"}
     httpd = ProxyAwareHTTPServer((host, port), Handler)
-    print(f"compose-webhook listen http://{host}:{port}  hook=POST /hook  dry_run={dry}")
-    print(f"workdir: {cwd}")
-    print(f"compose: {' '.join(compose_cmd())}")
+    print(f"{stamp()} compose-webhook listen http://{host}:{port}  hook=POST /hook  dry_run={dry}")
+    print(f"{stamp()} workdir: {cwd}")
+    print(f"{stamp()} compose: {' '.join(compose_cmd())}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nstop")
+        print(f"\n{stamp()} stop")
     finally:
         httpd.server_close()
     return 0
