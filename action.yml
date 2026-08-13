@@ -41,7 +41,7 @@ runs:
         WEBHOOK_TIMEOUT: ${{ inputs.timeout }}
         WEBHOOK_WAIT: ${{ inputs.wait }}
         WEBHOOK_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
-      run: bash "${{ github.action_path }}/scripts/trigger.sh"
+      run: python3 "${{ github.action_path }}/scripts/trigger.py"
 branding:
   icon: upload-cloud
   color: blue

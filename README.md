@@ -27,14 +27,21 @@ COMPOSE_ARGS=up --build -d
 
 ### FRP
 
+TCP 隧道对端永远是 `127.0.0.1`。要记真实源 IP，**只给 webhook 这一条**开 PROXY protocol（先重启 listener，再重载 frpc）：
+
 ```toml
 [[proxies]]
-name = "compose-webhook"
+name = "tpp-webhook"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 19090
 remotePort = 19090
+transport.proxyProtocolVersion = "v2"
 ```
+
+不要给 `ssh-home` / `caigou` 开。listener 会剥掉 PROXY 头，日志变成 `203.0.113.9 xff=- - "GET /info.php ..."`。
+
+不要改成 `type = "http"`：要占 frps vhost HTTP 口，和现在的 `http://<ip>:19090/hook` 不兼容。
 
 ## 调用仓（zb）
 

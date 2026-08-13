@@ -32,4 +32,4 @@ jobs:
           WEBHOOK_TOKEN=test-token-16xxxx \
           WEBHOOK_WAIT=true \
           WEBHOOK_WAIT_TIMEOUT=10 \
-            bash scripts/trigger.sh
+            python3 scripts/trigger.py

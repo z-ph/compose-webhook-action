@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -15,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+PROXY_V2_SIG = b"\r\n\r\n\x00\r\nQUIT\n"
 
 HERE = Path(__file__).resolve().parent
 HOOK_ENV = HERE / ".env"
@@ -76,6 +80,73 @@ def extract_token(handler: BaseHTTPRequestHandler) -> str:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return handler.headers.get("X-Webhook-Token", "").strip()
+
+
+def parse_proxy_v1_line(line: str) -> tuple[str, int] | None:
+    parts = line.strip().split()
+    if len(parts) >= 6 and parts[0] == "PROXY" and parts[1] in {"TCP4", "TCP6"}:
+        return parts[2], int(parts[4])
+    return None
+
+
+def parse_proxy_v2_header(header: bytes, rest: bytes) -> tuple[str, int] | None:
+    if len(header) < 16 or not header.startswith(PROXY_V2_SIG):
+        return None
+    ver_cmd = header[12]
+    fam = header[13]
+    length = struct.unpack("!H", header[14:16])[0]
+    if (ver_cmd & 0xF0) != 0x20 or len(rest) < length:
+        return None
+    if ver_cmd & 0x0F == 0x00:
+        return None
+    if fam == 0x11 and length >= 12:
+        src = socket.inet_ntoa(rest[0:4])
+        port = struct.unpack("!H", rest[8:10])[0]
+        return src, port
+    if fam == 0x21 and length >= 36:
+        src = socket.inet_ntop(socket.AF_INET6, rest[0:16])
+        port = struct.unpack("!H", rest[32:34])[0]
+        return src, port
+    return None
+
+
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def accept_proxy_protocol(sock: socket.socket, addr: tuple[str, int]) -> tuple[str, int]:
+    try:
+        peek = sock.recv(16, socket.MSG_PEEK)
+    except OSError:
+        return addr
+    if peek.startswith(b"PROXY "):
+        raw = b""
+        while b"\r\n" not in raw:
+            chunk = sock.recv(1)
+            if not chunk:
+                break
+            raw += chunk
+        parsed = parse_proxy_v1_line(raw.decode("ascii", errors="replace"))
+        return parsed if parsed else addr
+    if peek.startswith(PROXY_V2_SIG):
+        header = recv_exact(sock, 16)
+        length = struct.unpack("!H", header[14:16])[0] if len(header) == 16 else 0
+        rest = recv_exact(sock, length)
+        parsed = parse_proxy_v2_header(header, rest)
+        return parsed if parsed else addr
+    return addr
+
+
+class ProxyAwareHTTPServer(ThreadingHTTPServer):
+    def get_request(self) -> tuple[socket.socket, tuple[str, int]]:
+        sock, addr = super().get_request()
+        return sock, accept_proxy_protocol(sock, addr)
 
 
 def json_bytes(payload: dict[str, Any]) -> bytes:
@@ -146,7 +217,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "compose-webhook/1.0"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        xff = "-"
+        if hasattr(self, "headers") and self.headers is not None:
+            xff = self.headers.get("X-Forwarded-For", "-")
+        sys.stderr.write("%s xff=%s - %s\n" % (self.address_string(), xff, fmt % args))
 
     def _send(self, code: int, payload: dict[str, Any]) -> None:
         body = json_bytes(payload)
@@ -209,7 +283,15 @@ def self_test() -> int:
     cmd = compose_cmd()
     assert cmd[:3] == ["docker", "compose", "-f"]
     assert cmd[-3:] == ["up", "--build", "-d"]
-    assert secrets.compare_digest("abc", "abc")
+    assert parse_proxy_v1_line("PROXY TCP4 203.0.113.9 10.0.0.1 54321 19090") == ("203.0.113.9", 54321)
+    v2 = (
+        PROXY_V2_SIG
+        + bytes([0x21, 0x11, 0x00, 0x0C])
+        + socket.inet_aton("198.51.100.7")
+        + socket.inet_aton("10.0.0.1")
+        + struct.pack("!HH", 40000, 19090)
+    )
+    assert parse_proxy_v2_header(v2[:16], v2[16:]) == ("198.51.100.7", 40000)
     print("self-test ok")
     print("command:", " ".join(cmd))
     return 0
@@ -230,7 +312,7 @@ def main() -> int:
     host = os.environ.get("WEBHOOK_HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.environ.get("WEBHOOK_PORT", "19090"))
     dry = os.environ.get("WEBHOOK_DRY_RUN", "").strip() in {"1", "true", "yes"}
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = ProxyAwareHTTPServer((host, port), Handler)
     print(f"compose-webhook listen http://{host}:{port}  hook=POST /hook  dry_run={dry}")
     print(f"workdir: {cwd}")
     print(f"compose: {' '.join(compose_cmd())}")
