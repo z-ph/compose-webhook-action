@@ -14,6 +14,8 @@ jobs:
         run: python3 listener/server.py --self-test
       - name: Trigger unit tests
         run: python3 tests/test_trigger.py
+      - name: Listener unit tests
+        run: python3 tests/test_listener.py
       - name: Dry-run accept
         env:
           WEBHOOK_TOKEN: test-token-16xxxx

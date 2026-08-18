@@ -79,6 +79,58 @@ def compose_cmd() -> list[str]:
     return cmd
 
 
+def git_root(start: Path | None = None) -> Path | None:
+    current = (start or workdir()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def pull_enabled() -> bool:
+    return os.environ.get("GIT_PULL", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def job_steps() -> list[list[str]]:
+    steps: list[list[str]] = []
+    if pull_enabled():
+        root = git_root()
+        if root is not None:
+            steps.append(["git", "-C", str(root), "pull", "--ff-only"])
+    steps.append(compose_cmd())
+    return steps
+
+
+def run_steps(
+    steps: list[list[str]],
+    *,
+    log,
+    cwd: Path,
+    env: dict[str, str],
+    dry_run: bool,
+) -> int:
+    for cmd in steps:
+        log.write(f"$ {' '.join(cmd)}\n")
+        log.flush()
+        if dry_run:
+            log.write("WEBHOOK_DRY_RUN=1 — not executed\n")
+            log.flush()
+            continue
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return proc.returncode
+        if cmd and cmd[0] == "git" and "pull" in cmd:
+            env["GIT_SHA"] = git_sha()
+    return 0
+
+
 def extract_token(handler: BaseHTTPRequestHandler) -> str:
     auth = handler.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
@@ -168,31 +220,17 @@ def write_status(job: dict[str, Any]) -> None:
 def run_job(job_id: str, dry_run: bool) -> None:
     global _job
     log_path = STATE_DIR / f"{job_id}.log"
-    cmd = compose_cmd()
+    steps = job_steps()
     env = os.environ.copy()
     env.setdefault("GIT_SHA", git_sha())
     started = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _lock:
         assert _job is not None
-        _job.update({"status": "running", "started_at": started, "log": str(log_path), "command": cmd})
+        _job.update({"status": "running", "started_at": started, "log": str(log_path), "command": steps})
         write_status(_job)
     try:
         with log_path.open("w", encoding="utf-8") as log:
-            log.write(f"$ {' '.join(cmd)}\n")
-            log.flush()
-            if dry_run:
-                log.write("WEBHOOK_DRY_RUN=1 — compose not executed\n")
-                code = 0
-            else:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=str(workdir()),
-                    env=env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    check=False,
-                )
-                code = proc.returncode
+            code = run_steps(steps, log=log, cwd=workdir(), env=env, dry_run=dry_run)
         with _lock:
             assert _job is not None
             _job.update(
@@ -278,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
             globals()["_job"] = job
             write_status(job)
         threading.Thread(target=run_job, args=(job_id, dry_run), daemon=True).start()
-        self._send(202, {"accepted": True, "job_id": job_id, "dry_run": dry_run, "command": compose_cmd()})
+        self._send(202, {"accepted": True, "job_id": job_id, "dry_run": dry_run, "command": job_steps()})
 
 
 def self_test() -> int:
@@ -319,7 +357,7 @@ def main() -> int:
     httpd = ProxyAwareHTTPServer((host, port), Handler)
     print(f"{stamp()} compose-webhook listen http://{host}:{port}  hook=POST /hook  dry_run={dry}")
     print(f"{stamp()} workdir: {cwd}")
-    print(f"{stamp()} compose: {' '.join(compose_cmd())}")
+    print(f"{stamp()} steps: {' && '.join(' '.join(step) for step in job_steps())}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

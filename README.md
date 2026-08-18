@@ -1,6 +1,6 @@
 # compose-webhook-action
 
-GitHub Action：先 `GET /health` 确认 listener 存活，再发一次鉴权 POST，本机执行 `docker compose up --build -d`。
+GitHub Action：先 `GET /health` 确认 listener 存活，再发一次鉴权 POST。listener 在 `COMPOSE_WORKDIR` 对应仓库里 `git pull --ff-only`，成功后再执行 `docker compose up --build -d`。
 
 listener 只绑 `127.0.0.1`。外网用 FRP 转发。不把 docker.sock 挂进容器。
 
@@ -23,6 +23,7 @@ COMPOSE_WORKDIR=D:/git/zb
 COMPOSE_FILE=docker/docker-compose.yml
 COMPOSE_ENV=docker/.env
 COMPOSE_ARGS=up --build -d
+GIT_PULL=1
 ```
 
 ### FRP
@@ -66,7 +67,7 @@ transport.proxyProtocolVersion = "v2"
 | 方法 | 路径 | 鉴权 | 含义 |
 | --- | --- | --- | --- |
 | GET | `/health` | 否 | 存活 |
-| POST | `/hook` | Bearer / `X-Webhook-Token` | 排队执行 compose，202 |
+| POST | `/hook` | Bearer / `X-Webhook-Token` | 先 `git pull --ff-only`，再排队执行 compose，202 |
 | GET | `/status` | 是 | 当前 job |
 
 构建中再打 `/hook` → `409`。`WEBHOOK_DRY_RUN=1` 只记账。
