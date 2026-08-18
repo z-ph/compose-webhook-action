@@ -1,6 +1,6 @@
 # compose-webhook-action
 
-GitHub Action：向本机 listener 发一次鉴权 POST，本机执行 `docker compose up --build -d`。
+GitHub Action：先 `GET /health` 确认 listener 存活，再发一次鉴权 POST，本机执行 `docker compose up --build -d`。
 
 listener 只绑 `127.0.0.1`。外网用 FRP 转发。不把 docker.sock 挂进容器。
 
@@ -47,7 +47,7 @@ transport.proxyProtocolVersion = "v2"
 
 仓库 secrets：
 
-- `COMPOSE_WEBHOOK_URL` — `http://<frps>:19090/hook`
+- `COMPOSE_WEBHOOK_URL` — `https://webhook.example/hook`（可省略 `/hook`；缺 scheme 时域名默认 `https://`，`host:port` / IP 默认 `http://`）
 - `COMPOSE_WEBHOOK_TOKEN` — 与 listener 相同
 
 ```yaml
@@ -56,6 +56,8 @@ transport.proxyProtocolVersion = "v2"
     url: ${{ secrets.COMPOSE_WEBHOOK_URL }}
     token: ${{ secrets.COMPOSE_WEBHOOK_TOKEN }}
 ```
+
+触发顺序：`GET /health`（200 才继续）→ `POST /hook`。`/health` 失败则不打 `/hook`。
 
 `wait: 'true'` 会轮询 `/status` 直到 compose 结束（默认只等 202）。
 

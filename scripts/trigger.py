@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""POST /hook (and optionally poll /status) using stdlib only."""
+"""GET /health then POST /hook (and optionally poll /status) using stdlib only."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -15,14 +16,39 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
-def hook_urls() -> tuple[str, str]:
-    url = env("WEBHOOK_URL").rstrip("/")
+def resolve_urls(raw: str) -> tuple[str, str]:
+    url = raw.strip().strip("'\"")
     if not url:
         print("::error::WEBHOOK_URL is empty")
         raise SystemExit(1)
-    if not url.endswith("/hook"):
-        url = f"{url}/hook"
-    return url, url[: -len("/hook")]
+
+    if "://" not in url:
+        host = url.split("/", 1)[0]
+        hostname = host.rsplit(":", 1)[0]
+        has_port = ":" in host and (host.rsplit(":", 1)[-1].isdigit())
+        use_http = has_port or all(part.isdigit() for part in hostname.split("."))
+        url = f"{'http' if use_http else 'https'}://{url}"
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        print("::error::WEBHOOK_URL is not an http(s) URL")
+        raise SystemExit(1)
+
+    path = parsed.path.rstrip("/") or ""
+    if path.endswith("/hook"):
+        hook_path = path
+        base_path = path[: -len("/hook")]
+    else:
+        hook_path = f"{path}/hook"
+        base_path = path
+
+    base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, base_path, "", ""))
+    hook = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, hook_path, "", ""))
+    return hook, base.rstrip("/")
+
+
+def hook_urls() -> tuple[str, str]:
+    return resolve_urls(env("WEBHOOK_URL"))
 
 
 def request(
@@ -32,11 +58,18 @@ def request(
     token: str,
     timeout: float,
     data: bytes | None = None,
+    auth: bool = True,
 ) -> tuple[int, str]:
-    headers = {"Authorization": f"Bearer {token}"}
+    headers: dict[str, str] = {}
+    if auth:
+        headers["Authorization"] = f"Bearer {token}"
     if data is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    except ValueError as exc:
+        print("::error::WEBHOOK_URL is not a valid http(s) URL")
+        raise SystemExit(1) from exc
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return int(resp.status), resp.read().decode("utf-8")
@@ -64,12 +97,31 @@ def parse_object(body: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def probe_health(base: str, timeout: float) -> int:
+    health_url = f"{base}/health"
+    http_code, body = request(health_url, method="GET", token="", timeout=timeout, auth=False)
+    print(f"health HTTP {http_code}")
+    if body:
+        print(body)
+    if http_code != 200:
+        print(f"::error::webhook /health failed (HTTP {http_code})")
+        return 1
+    payload = parse_object(body)
+    if payload and payload.get("ok") is False:
+        print("::error::webhook /health returned ok=false")
+        return 1
+    return 0
+
+
 def main() -> int:
     url, base = hook_urls()
     token = env("WEBHOOK_TOKEN")
     timeout = float(env("WEBHOOK_TIMEOUT", "30") or "30")
     wait = env("WEBHOOK_WAIT", "false") == "true"
     wait_timeout = int(env("WEBHOOK_WAIT_TIMEOUT", "1800") or "1800")
+
+    if probe_health(base, timeout) != 0:
+        return 1
 
     http_code, body = request(url, method="POST", token=token, timeout=timeout, data=b"{}")
     print(f"hook HTTP {http_code}")

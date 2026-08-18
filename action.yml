@@ -2,7 +2,7 @@ name: Compose Webhook
 description: POST an authenticated webhook that runs docker compose up --build -d on the host
 inputs:
   url:
-    description: Webhook base or /hook URL (e.g. http://frps:19090/hook)
+    description: Webhook base or /hook URL (https://host, host, or http://ip:port/hook). GET /health runs first.
     required: true
   token:
     description: Bearer token matching the listener WEBHOOK_TOKEN
