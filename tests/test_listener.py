@@ -91,5 +91,58 @@ class RunStepsTests(unittest.TestCase):
         self.assertIn("WEBHOOK_DRY_RUN=1", text)
 
 
+class SingleSlotQueueTests(unittest.TestCase):
+    def setUp(self) -> None:
+        listener.reset_jobs()
+
+    def tearDown(self) -> None:
+        listener.reset_jobs()
+
+    def test_idle_hook_starts_immediately(self) -> None:
+        with mock.patch.object(listener.threading.Thread, "start"):
+            result = listener.accept_hook(dry_run=True)
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["queued"])
+        self.assertEqual(listener.current_job()["status"], "queued")
+        self.assertIsNone(listener.pending_job())
+
+    def test_busy_hook_waits_in_single_slot(self) -> None:
+        listener.set_running_job("run1")
+        result = listener.accept_hook(dry_run=True)
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["queued"])
+        pending = listener.pending_job()
+        self.assertIsNotNone(pending)
+        self.assertEqual(result["job_id"], pending["id"])
+        self.assertEqual(listener.current_job()["id"], "run1")
+
+    def test_one_hundred_hooks_keep_single_waiter(self) -> None:
+        listener.set_running_job("run1")
+        first = listener.accept_hook(dry_run=True)
+        ids = {first["job_id"]}
+        coalesced = 0
+        for _ in range(99):
+            result = listener.accept_hook(dry_run=True)
+            self.assertTrue(result["accepted"])
+            self.assertTrue(result["queued"])
+            ids.add(result["job_id"])
+            if result.get("coalesced"):
+                coalesced += 1
+        self.assertEqual(ids, {first["job_id"]})
+        self.assertEqual(coalesced, 99)
+        self.assertEqual(listener.pending_job()["id"], first["job_id"])
+        self.assertEqual(listener.pending_job().get("coalesced"), 99)
+
+    def test_finished_job_starts_pending(self) -> None:
+        listener.set_running_job("run1")
+        waiting = listener.accept_hook(dry_run=True)
+        started: list[str] = []
+        with mock.patch.object(listener, "start_job", side_effect=lambda job_id, dry_run: started.append(job_id)):
+            listener.finish_job("run1", code=0)
+        self.assertEqual(started, [waiting["job_id"]])
+        self.assertEqual(listener.current_job()["id"], waiting["job_id"])
+        self.assertIsNone(listener.pending_job())
+
+
 if __name__ == "__main__":
     unittest.main()

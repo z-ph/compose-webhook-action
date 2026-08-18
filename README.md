@@ -67,7 +67,7 @@ transport.proxyProtocolVersion = "v2"
 | 方法 | 路径 | 鉴权 | 含义 |
 | --- | --- | --- | --- |
 | GET | `/health` | 否 | 存活 |
-| POST | `/hook` | Bearer / `X-Webhook-Token` | 先 `git pull --ff-only`，再排队执行 compose，202 |
+| POST | `/hook` | Bearer / `X-Webhook-Token` | 先 `git pull --ff-only`，再执行 compose。构建中只暂存 1 个等待任务，后续 hook 合并到这个等待位，一律 202 |
 | GET | `/status` | 是 | 当前 job |
 
-构建中再打 `/hook` → `409`。`WEBHOOK_DRY_RUN=1` 只记账。
+构建中再打 `/hook` 不再 `409`：只保留 1 个等待任务，100 次 hook 也只再跑一轮。`WEBHOOK_DRY_RUN=1` 只记账。

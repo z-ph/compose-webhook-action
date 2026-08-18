@@ -26,6 +26,7 @@ STATE_DIR = HERE / "var"
 
 _lock = threading.Lock()
 _job: dict[str, Any] | None = None
+_pending: dict[str, Any] | None = None
 
 
 def stamp() -> str:
@@ -209,50 +210,141 @@ def json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
-def write_status(job: dict[str, Any]) -> None:
+def write_status(job: dict[str, Any] | None = None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     (STATE_DIR / "status.json").write_text(
-        json.dumps(job, ensure_ascii=False, indent=2) + "\n",
+        json.dumps({"job": job if job is not None else _job, "pending": _pending}, ensure_ascii=False, indent=2)
+        + "\n",
         encoding="utf-8",
     )
 
 
-def run_job(job_id: str, dry_run: bool) -> None:
+def reset_jobs() -> None:
+    global _job, _pending
+    with _lock:
+        _job = None
+        _pending = None
+
+
+def current_job() -> dict[str, Any] | None:
+    return _job
+
+
+def pending_job() -> dict[str, Any] | None:
+    return _pending
+
+
+def new_job(dry_run: bool, status: str) -> dict[str, Any]:
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "status": status,
+        "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "dry_run": dry_run,
+        "coalesced": 0,
+    }
+
+
+def set_running_job(job_id: str, dry_run: bool = True) -> dict[str, Any]:
     global _job
+    with _lock:
+        _job = {
+            "id": job_id,
+            "status": "running",
+            "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "dry_run": dry_run,
+            "coalesced": 0,
+        }
+        write_status(_job)
+        return dict(_job)
+
+
+def start_job(job_id: str, dry_run: bool) -> None:
+    threading.Thread(target=run_job, args=(job_id, dry_run), daemon=True).start()
+
+
+def accept_hook(dry_run: bool) -> dict[str, Any]:
+    global _job, _pending
+    with _lock:
+        if _job and _job.get("status") in {"queued", "running"}:
+            if _pending is None:
+                _pending = new_job(dry_run, "waiting")
+                write_status(_job)
+                return {
+                    "accepted": True,
+                    "queued": True,
+                    "coalesced": False,
+                    "job_id": _pending["id"],
+                    "dry_run": dry_run,
+                    "command": job_steps(),
+                }
+            _pending["coalesced"] = int(_pending.get("coalesced") or 0) + 1
+            _pending["dry_run"] = dry_run
+            _pending["last_accepted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            write_status(_job)
+            return {
+                "accepted": True,
+                "queued": True,
+                "coalesced": True,
+                "job_id": _pending["id"],
+                "dry_run": dry_run,
+                "command": job_steps(),
+            }
+        job = new_job(dry_run, "queued")
+        _job = job
+        write_status(job)
+        start_job(job["id"], dry_run)
+        return {
+            "accepted": True,
+            "queued": False,
+            "coalesced": False,
+            "job_id": job["id"],
+            "dry_run": dry_run,
+            "command": job_steps(),
+        }
+
+
+def finish_job(job_id: str, code: int, error: str | None = None) -> None:
+    global _job, _pending
+    nxt: dict[str, Any] | None = None
+    with _lock:
+        if _job is None or _job.get("id") != job_id:
+            return
+        payload = {
+            "status": "ok" if code == 0 else "fail",
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "returncode": code,
+        }
+        if error:
+            payload["error"] = error
+        _job.update(payload)
+        write_status(_job)
+        if _pending is not None:
+            nxt = _pending
+            _pending = None
+            nxt["status"] = "queued"
+            _job = nxt
+            write_status(_job)
+    if nxt is not None:
+        start_job(nxt["id"], bool(nxt.get("dry_run")))
+
+
+def run_job(job_id: str, dry_run: bool) -> None:
     log_path = STATE_DIR / f"{job_id}.log"
     steps = job_steps()
     env = os.environ.copy()
     env.setdefault("GIT_SHA", git_sha())
     started = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _lock:
-        assert _job is not None
+        if _job is None or _job.get("id") != job_id:
+            return
         _job.update({"status": "running", "started_at": started, "log": str(log_path), "command": steps})
         write_status(_job)
     try:
         with log_path.open("w", encoding="utf-8") as log:
             code = run_steps(steps, log=log, cwd=workdir(), env=env, dry_run=dry_run)
-        with _lock:
-            assert _job is not None
-            _job.update(
-                {
-                    "status": "ok" if code == 0 else "fail",
-                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "returncode": code,
-                }
-            )
-            write_status(_job)
+        finish_job(job_id, code)
     except Exception as exc:  # noqa: BLE001
-        with _lock:
-            assert _job is not None
-            _job.update(
-                {
-                    "status": "fail",
-                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "returncode": -1,
-                    "error": str(exc),
-                }
-            )
-            write_status(_job)
+        finish_job(job_id, -1, error=str(exc))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -287,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._auth():
                 return
             with _lock:
-                self._send(200, {"job": _job})
+                self._send(200, {"job": _job, "pending": _pending})
             return
         self._send(404, {"error": "not found"})
 
@@ -302,21 +394,8 @@ class Handler(BaseHTTPRequestHandler):
         if length:
             self.rfile.read(length)
         dry_run = os.environ.get("WEBHOOK_DRY_RUN", "").strip() in {"1", "true", "yes"}
-        with _lock:
-            if _job and _job.get("status") == "running":
-                self._send(409, {"error": "busy", "job": _job})
-                return
-            job_id = uuid.uuid4().hex[:12]
-            job = {
-                "id": job_id,
-                "status": "queued",
-                "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "dry_run": dry_run,
-            }
-            globals()["_job"] = job
-            write_status(job)
-        threading.Thread(target=run_job, args=(job_id, dry_run), daemon=True).start()
-        self._send(202, {"accepted": True, "job_id": job_id, "dry_run": dry_run, "command": job_steps()})
+        result = accept_hook(dry_run)
+        self._send(202, result)
 
 
 def self_test() -> int:
