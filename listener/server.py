@@ -133,7 +133,9 @@ def run_steps(
         if proc.returncode != 0:
             return proc.returncode
         if cmd and cmd[0] == "git" and "pull" in cmd:
-            env["GIT_SHA"] = git_sha()
+            # pull 后更新本地解析值；但 webhook 传来的 sha（GitHub 确认的 commit）优先。
+            if not env.get("GIT_SHA"):
+                env["GIT_SHA"] = git_sha()
     return 0
 
 
@@ -473,7 +475,11 @@ def run_job(job_id: str, dry_run: bool) -> None:
     log_path = STATE_DIR / f"{job_id}.log"
     steps = job_steps()
     env = os.environ.copy()
-    env.setdefault("GIT_SHA", git_sha())
+    # commit hash 优先用 webhook 传来的 github.sha（GitHub 确认的真实 commit），
+    # 避免本地 git_sha() 在 git pull --ff-only 之前读到旧 HEAD 的时序错位。
+    gh = (_job or {}).get("github") or {}
+    webhook_sha = str(gh.get("sha") or "").strip()
+    env.setdefault("GIT_SHA", webhook_sha or git_sha())
     started = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _lock:
         if _job is None or _job.get("id") != job_id:
