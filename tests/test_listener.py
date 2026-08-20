@@ -144,5 +144,113 @@ class SingleSlotQueueTests(unittest.TestCase):
         self.assertIsNone(listener.pending_job())
 
 
+class ParseHookBodyTests(unittest.TestCase):
+    def test_empty_body_returns_empty(self) -> None:
+        self.assertEqual(listener.parse_hook_body(b""), {})
+
+    def test_invalid_json_returns_empty(self) -> None:
+        self.assertEqual(listener.parse_hook_body(b"not-json"), {})
+
+    def test_extracts_feishu_and_github(self) -> None:
+        raw = (
+            b'{"feishu": {"webhook": "https://open.feishu.cn/h/x", '
+            b'"secret": "s3cr3t"}, "github": {"repo": "z-ph/zb", '
+            b'"ref": "refs/heads/main", "sha": "abcdef0", "actor": "z-ph", '
+            b'"run_url": "https://github.com/z-ph/zb/actions/runs/1", '
+            b'"message": "hello"}}'
+        )
+        out = listener.parse_hook_body(raw)
+        self.assertEqual(out["feishu"], {"webhook": "https://open.feishu.cn/h/x", "secret": "s3cr3t"})
+        self.assertEqual(out["github"]["repo"], "z-ph/zb")
+        self.assertEqual(out["github"]["sha"], "abcdef0")
+
+    def test_empty_webhook_drops_feishu(self) -> None:
+        out = listener.parse_hook_body(b'{"feishu": {"webhook": ""}}')
+        self.assertNotIn("feishu", out)
+
+
+class FeishuPayloadTests(unittest.TestCase):
+    def test_success_payload(self) -> None:
+        job = {
+            "status": "ok",
+            "returncode": 0,
+            "github": {"repo": "z-ph/zb", "ref": "refs/heads/main", "sha": "abcdef0", "actor": "z-ph"},
+        }
+        payload = listener.build_feishu_payload(job)
+        self.assertEqual(payload["msg_type"], "post")
+        self.assertEqual(payload["content"]["post"]["zh_cn"]["title"], "✅ 部署成功")
+        content = payload["content"]["post"]["zh_cn"]["content"]
+        flat = [el.get("text", el.get("href")) for line in content for el in line]
+        self.assertTrue(any("z-ph/zb" in t for t in flat))
+        self.assertTrue(any("abcdef0" in t for t in flat))
+        self.assertTrue(any("返回码：0" in t for t in flat))
+
+    def test_failure_payload_includes_error_and_link(self) -> None:
+        job = {
+            "status": "fail",
+            "returncode": 1,
+            "error": "boom",
+            "github": {"repo": "z-ph/zb", "run_url": "https://github.com/z-ph/zb/actions/runs/2"},
+        }
+        payload = listener.build_feishu_payload(job)
+        self.assertEqual(payload["content"]["post"]["zh_cn"]["title"], "❌ 部署失败")
+        content = payload["content"]["post"]["zh_cn"]["content"]
+        link_line = [el for line in content for el in line if el.get("tag") == "a"]
+        self.assertEqual(link_line[0]["href"], "https://github.com/z-ph/zb/actions/runs/2")
+        flat = [el.get("text") for line in content for el in line if el.get("tag") == "text"]
+        self.assertTrue(any("boom" in t for t in flat))
+
+
+class FeishuSignTests(unittest.TestCase):
+    def test_sign_matches_algorithm(self) -> None:
+        timestamp, secret = "1599368391", "abc"
+        # 独立复现官方算法：HMAC-SHA256(key=`${ts}\n${secret}`, msg=b"") → base64
+        digest = __import__("hmac").new(
+            f"{timestamp}\n{secret}".encode("utf-8"), b"", __import__("hashlib").sha256
+        ).digest()
+        expected = __import__("base64").b64encode(digest).decode("ascii")
+        self.assertEqual(listener.feishu_sign(timestamp, secret), expected)
+
+    def test_sign_changes_with_secret(self) -> None:
+        ts = "1700000000"
+        self.assertNotEqual(listener.feishu_sign(ts, "a"), listener.feishu_sign(ts, "b"))
+
+
+class FinishJobNotifyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        listener.reset_jobs()
+
+    def tearDown(self) -> None:
+        listener.reset_jobs()
+
+    def test_finish_job_sends_feishu(self) -> None:
+        listener.set_running_job("run1")
+        listener._job["feishu"] = {"webhook": "https://open.feishu.cn/h/x", "secret": ""}
+        listener._job["github"] = {"repo": "z-ph/zb", "sha": "abcdef0"}
+        sent: list[tuple] = []
+
+        def fake_send(webhook, payload, secret):
+            sent.append((webhook, payload, secret))
+
+        with mock.patch.object(listener, "start_job"), mock.patch.object(listener, "send_feishu", side_effect=fake_send):
+            listener.finish_job("run1", code=0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "https://open.feishu.cn/h/x")
+        self.assertEqual(sent[0][1]["content"]["post"]["zh_cn"]["title"], "✅ 部署成功")
+        self.assertEqual(sent[0][2], "")
+
+    def test_finish_job_skips_when_no_webhook(self) -> None:
+        listener.set_running_job("run1")  # 无 feishu 配置
+        sent: list = []
+
+        def fake_send(*args, **kwargs):
+            sent.append(args)
+
+        with mock.patch.object(listener, "start_job"), mock.patch.object(listener, "send_feishu", side_effect=fake_send):
+            listener.finish_job("run1", code=1)
+        # 无 webhook 时 notify_feishu 早退，send_feishu 不被调用
+        self.assertEqual(sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()

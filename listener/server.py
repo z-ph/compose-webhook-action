@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -16,6 +19,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import urlparse
 
 PROXY_V2_SIG = b"\r\n\r\n\x00\r\nQUIT\n"
@@ -234,14 +239,20 @@ def pending_job() -> dict[str, Any] | None:
     return _pending
 
 
-def new_job(dry_run: bool, status: str) -> dict[str, Any]:
-    return {
+def new_job(dry_run: bool, status: str, hook_input: dict[str, Any] | None = None) -> dict[str, Any]:
+    job: dict[str, Any] = {
         "id": uuid.uuid4().hex[:12],
         "status": status,
         "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "dry_run": dry_run,
         "coalesced": 0,
     }
+    if hook_input:
+        if hook_input.get("feishu"):
+            job["feishu"] = hook_input["feishu"]
+        if hook_input.get("github"):
+            job["github"] = hook_input["github"]
+    return job
 
 
 def set_running_job(job_id: str, dry_run: bool = True) -> dict[str, Any]:
@@ -262,12 +273,12 @@ def start_job(job_id: str, dry_run: bool) -> None:
     threading.Thread(target=run_job, args=(job_id, dry_run), daemon=True).start()
 
 
-def accept_hook(dry_run: bool) -> dict[str, Any]:
+def accept_hook(dry_run: bool, hook_input: dict[str, Any] | None = None) -> dict[str, Any]:
     global _job, _pending
     with _lock:
         if _job and _job.get("status") in {"queued", "running"}:
             if _pending is None:
-                _pending = new_job(dry_run, "waiting")
+                _pending = new_job(dry_run, "waiting", hook_input)
                 write_status(_job)
                 return {
                     "accepted": True,
@@ -280,6 +291,11 @@ def accept_hook(dry_run: bool) -> dict[str, Any]:
             _pending["coalesced"] = int(_pending.get("coalesced") or 0) + 1
             _pending["dry_run"] = dry_run
             _pending["last_accepted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            if hook_input:
+                if hook_input.get("feishu"):
+                    _pending["feishu"] = hook_input["feishu"]
+                if hook_input.get("github"):
+                    _pending["github"] = hook_input["github"]
             write_status(_job)
             return {
                 "accepted": True,
@@ -289,7 +305,7 @@ def accept_hook(dry_run: bool) -> dict[str, Any]:
                 "dry_run": dry_run,
                 "command": job_steps(),
             }
-        job = new_job(dry_run, "queued")
+        job = new_job(dry_run, "queued", hook_input)
         _job = job
         write_status(job)
         start_job(job["id"], dry_run)
@@ -306,6 +322,7 @@ def accept_hook(dry_run: bool) -> dict[str, Any]:
 def finish_job(job_id: str, code: int, error: str | None = None) -> None:
     global _job, _pending
     nxt: dict[str, Any] | None = None
+    finished: dict[str, Any] | None = None
     with _lock:
         if _job is None or _job.get("id") != job_id:
             return
@@ -318,14 +335,138 @@ def finish_job(job_id: str, code: int, error: str | None = None) -> None:
             payload["error"] = error
         _job.update(payload)
         write_status(_job)
+        finished = dict(_job)
         if _pending is not None:
             nxt = _pending
             _pending = None
             nxt["status"] = "queued"
             _job = nxt
             write_status(_job)
+    # 通知在锁外发送：网络 IO 不阻塞后续 /hook 接收与下一轮 compose 启动。
+    # 失败只记日志，绝不影响 job 状态流转。
+    if finished is not None:
+        notify_feishu(finished)
     if nxt is not None:
         start_job(nxt["id"], bool(nxt.get("dry_run")))
+
+
+def parse_hook_body(raw: bytes) -> dict[str, Any]:
+    """从 POST /hook body 解析飞书通知配置与 GitHub 上下文（best-effort）。"""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, Any] = {}
+    feishu = data.get("feishu")
+    if isinstance(feishu, dict):
+        webhook = str(feishu.get("webhook") or "").strip()
+        if webhook:
+            result["feishu"] = {
+                "webhook": webhook,
+                "secret": str(feishu.get("secret") or "").strip(),
+            }
+    github = data.get("github")
+    if isinstance(github, dict):
+        result["github"] = {
+            "repo": str(github.get("repo") or ""),
+            "ref": str(github.get("ref") or ""),
+            "sha": str(github.get("sha") or ""),
+            "actor": str(github.get("actor") or ""),
+            "run_url": str(github.get("run_url") or ""),
+            "message": str(github.get("message") or ""),
+        }
+    return result
+
+
+def short_sha(sha: str) -> str:
+    return (sha or "")[:7]
+
+
+def feishu_sign(timestamp: str, secret: str) -> str:
+    # 飞书自定义机器人签名：HMAC-SHA256，key 为 `${timestamp}\n${secret}`，对空串签名后 base64。
+    key = f"{timestamp}\n{secret}".encode("utf-8")
+    digest = hmac.new(key, b"", hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def build_feishu_payload(job: dict[str, Any]) -> dict[str, Any]:
+    ok = job.get("status") == "ok"
+    title = "✅ 部署成功" if ok else "❌ 部署失败"
+    gh = job.get("github") or {}
+    lines: list[list[dict[str, Any]]] = []
+
+    def text(value: str) -> dict[str, Any]:
+        return {"tag": "text", "text": value}
+
+    def add(*elements: dict[str, Any]) -> None:
+        lines.append(list(elements))
+
+    if gh.get("repo"):
+        add(text(f"仓库：{gh['repo']}"))
+    if gh.get("ref"):
+        add(text(f"分支：{gh['ref']}"))
+    if gh.get("sha"):
+        add(text(f"提交：{short_sha(gh['sha'])}"))
+    if gh.get("actor"):
+        add(text(f"触发者：{gh['actor']}"))
+    if gh.get("message"):
+        add(text(f"说明：{gh['message']}"))
+    code = job.get("returncode")
+    if code is not None:
+        add(text(f"返回码：{code}"))
+    if not ok and job.get("error"):
+        add(text(f"错误：{job['error']}"))
+    run_url = gh.get("run_url") or ""
+    if run_url:
+        add({"tag": "a", "text": "查看 GitHub Actions 运行", "href": run_url})
+
+    return {"msg_type": "post", "content": {"post": {"zh_cn": {"title": title, "content": lines}}}}
+
+
+def send_feishu(webhook: str, payload: dict[str, Any], secret: str) -> None:
+    body = dict(payload)
+    secret = (secret or "").strip()
+    if secret:
+        timestamp = str(int(time.time()))
+        body["timestamp"] = timestamp
+        body["sign"] = feishu_sign(timestamp, secret)
+    data = json_bytes(body)
+    req = urllib_request.Request(
+        webhook,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=10) as resp:
+            resp_text = resp.read().decode("utf-8", errors="replace")
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"feishu request failed: {exc.reason}") from exc
+    try:
+        result = json.loads(resp_text)
+    except json.JSONDecodeError:
+        result = {}
+    if not isinstance(result, dict) or result.get("code") != 0:
+        raise RuntimeError(f"feishu rejected: {resp_text}")
+
+
+def notify_feishu(job: dict[str, Any]) -> None:
+    # /hook body 优先；listener .env 的 FEISHU_WEBHOOK/FEISHU_SECRET 作服务端兜底。
+    feishu = job.get("feishu") or {}
+    webhook = (feishu.get("webhook") or os.environ.get("FEISHU_WEBHOOK", "")).strip()
+    if not webhook:
+        return
+    secret = (feishu.get("secret") or os.environ.get("FEISHU_SECRET", "")).strip()
+    try:
+        payload = build_feishu_payload(job)
+        send_feishu(webhook, payload, secret)
+        sys.stderr.write(f"{stamp()} feishu notify ok ({job.get('status')})\n")
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"{stamp()} feishu notify failed: {exc}\n")
 
 
 def run_job(job_id: str, dry_run: bool) -> None:
@@ -391,10 +532,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             return
         length = int(self.headers.get("Content-Length", "0") or 0)
-        if length:
-            self.rfile.read(length)
+        raw = self.rfile.read(length) if length else b""
+        hook_input = parse_hook_body(raw)
         dry_run = os.environ.get("WEBHOOK_DRY_RUN", "").strip() in {"1", "true", "yes"}
-        result = accept_hook(dry_run)
+        result = accept_hook(dry_run, hook_input)
         self._send(202, result)
 
 

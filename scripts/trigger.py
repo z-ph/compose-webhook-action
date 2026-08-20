@@ -16,6 +16,23 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
+def hook_body() -> bytes:
+    # 把飞书通知配置与 GitHub 上下文塞进 /hook body，listener 在 compose 完成/失败时据此发飞书。
+    feishu_webhook = env("FEISHU_WEBHOOK")
+    github = {
+        "repo": env("GITHUB_REPOSITORY"),
+        "ref": env("GITHUB_REF"),
+        "sha": env("GITHUB_SHA"),
+        "actor": env("GITHUB_ACTOR"),
+        "run_url": env("GITHUB_SERVER_URL", "https://github.com")
+        + f"/{env('GITHUB_REPOSITORY')}/actions/runs/{env('GITHUB_RUN_ID')}",
+        "message": env("GITHUB_MESSAGE"),
+    }
+    feishu = {"webhook": feishu_webhook, "secret": env("FEISHU_SECRET")}
+    payload = {"feishu": feishu, "github": github}
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 def resolve_urls(raw: str) -> tuple[str, str]:
     url = raw.strip().strip("'\"")
     if not url:
@@ -123,7 +140,7 @@ def main() -> int:
     if probe_health(base, timeout) != 0:
         return 1
 
-    http_code, body = request(url, method="POST", token=token, timeout=timeout, data=b"{}")
+    http_code, body = request(url, method="POST", token=token, timeout=timeout, data=hook_body())
     print(f"hook HTTP {http_code}")
     print(body)
 

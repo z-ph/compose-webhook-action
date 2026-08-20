@@ -52,6 +52,33 @@ class ResolveUrlsTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
 
 
+class HookBodyTests(unittest.TestCase):
+    def test_includes_feishu_and_github(self) -> None:
+        env = {
+            "FEISHU_WEBHOOK": "https://open.feishu.cn/h/x",
+            "FEISHU_SECRET": "s3cr3t",
+            "GITHUB_REPOSITORY": "z-ph/zb",
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_SHA": "abcdef0",
+            "GITHUB_ACTOR": "z-ph",
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_MESSAGE": "",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            body = json.loads(trigger.hook_body().decode("utf-8"))
+        self.assertEqual(body["feishu"]["webhook"], "https://open.feishu.cn/h/x")
+        self.assertEqual(body["feishu"]["secret"], "s3cr3t")
+        self.assertEqual(body["github"]["repo"], "z-ph/zb")
+        self.assertEqual(body["github"]["sha"], "abcdef0")
+        self.assertEqual(body["github"]["run_url"], "https://github.com/z-ph/zb/actions/runs/123")
+
+    def test_empty_feishu_still_serializes(self) -> None:
+        with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_SECRET": ""}, clear=False):
+            body = json.loads(trigger.hook_body().decode("utf-8"))
+        self.assertEqual(body["feishu"]["webhook"], "")
+
+
 class _Recorder:
     def __init__(self) -> None:
         self.paths: list[str] = []

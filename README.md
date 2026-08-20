@@ -50,15 +50,21 @@ transport.proxyProtocolVersion = "v2"
 
 - `COMPOSE_WEBHOOK_URL` — `https://webhook.example/hook`（可省略 `/hook`；缺 scheme 时域名默认 `https://`，`host:port` / IP 默认 `http://`）
 - `COMPOSE_WEBHOOK_TOKEN` — 与 listener 相同
+- `FEISHU_WEBHOOK_URL` —（可选）飞书自定义机器人 webhook，compose 成功/失败后通知
+- `FEISHU_SECRET` —（可选）飞书机器人加签密钥，与 webhook 同侧
 
 ```yaml
 - uses: z-ph/compose-webhook-action@v1
   with:
     url: ${{ secrets.COMPOSE_WEBHOOK_URL }}
     token: ${{ secrets.COMPOSE_WEBHOOK_TOKEN }}
+    feishu-webhook: ${{ secrets.FEISHU_WEBHOOK_URL }}
+    feishu-secret: ${{ secrets.FEISHU_SECRET }}
 ```
 
-触发顺序：`GET /health`（200 才继续）→ `POST /hook`。`/health` 失败则不打 `/hook`。
+触发顺序：`GET /health`（200 才继续）→ `POST /hook`（body 带 `feishu` + GitHub 上下文）。`/health` 失败则不打 `/hook`。
+
+compose 结束后 listener 按结果发飞书通知（成功 ✅ / 失败 ❌，含仓库、分支、提交、触发者、返回码与 Actions 运行链接）。飞书配置优先取 `/hook` body，未带时回退 listener `.env` 的 `FEISHU_WEBHOOK` / `FEISHU_SECRET`。通知失败只记日志，不影响部署。
 
 `wait: 'true'` 会轮询 `/status` 直到 compose 结束（默认只等 202）。
 
@@ -71,3 +77,13 @@ transport.proxyProtocolVersion = "v2"
 | GET | `/status` | 是 | 当前 job |
 
 构建中再打 `/hook` 不再 `409`：只保留 1 个等待任务，100 次 hook 也只再跑一轮。`WEBHOOK_DRY_RUN=1` 只记账。
+
+## 飞书通知
+
+compose 完成后 listener 向飞书自定义机器人发 post 消息：
+
+- 标题：`✅ 部署成功` / `❌ 部署失败`
+- 正文：仓库、分支、提交（短 sha）、触发者、返回码、错误（失败时）、Actions 运行链接
+- 签名：`FEISHU_SECRET` 非空时按官方算法（HMAC-SHA256，key=`${timestamp}\n${secret}`，空串，base64）加 `timestamp` / `sign`
+
+配置来源优先级：`/hook` body 的 `feishu` 字段 > listener `.env` 的 `FEISHU_WEBHOOK` / `FEISHU_SECRET`。两个都没有则不发。

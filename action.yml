@@ -19,6 +19,14 @@ inputs:
     description: Seconds to wait when wait=true
     required: false
     default: '1800'
+  feishu-webhook:
+    description: 飞书自定义机器人 webhook，compose 完成/失败后通知（可选）。留空则不通知。
+    required: false
+    default: ''
+  feishu-secret:
+    description: 飞书机器人加签密钥（与 webhook 同侧）。留空则明文发送。
+    required: false
+    default: ''
 outputs:
   job-id:
     description: Accepted job id
@@ -41,6 +49,8 @@ runs:
         WEBHOOK_TIMEOUT: ${{ inputs.timeout }}
         WEBHOOK_WAIT: ${{ inputs.wait }}
         WEBHOOK_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        FEISHU_WEBHOOK: ${{ inputs.feishu-webhook }}
+        FEISHU_SECRET: ${{ inputs.feishu-secret }}
       run: python3 "${{ github.action_path }}/scripts/trigger.py"
 branding:
   icon: upload-cloud
